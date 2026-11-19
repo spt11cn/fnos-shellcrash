@@ -98,28 +98,50 @@ sudo systemctl enable shellcrash
 
 ### 访问「其它网段」的内网服务器（重要）
 
-改成「网关指向 NAS」之后，客户机访问**本网段以外**的内网地址（例如 NAS 在 `192.168.1.x`，服务器在 `192.168.0.5`）
-要靠 NAS 做 IP 转发。而**飞牛装了 Docker，Docker 会把 iptables 的 `FORWARD` 策略设成 DROP**，
-默认不转发任何流量 —— 表现就是：能上外网，但 `ping 192.168.0.5` 100% 丢包、SMB/HTTP 全部超时。
+改成「网关指向 NAS」之后，客户机访问**本网段以外**的内网地址（例如 NAS 在 `192.168.1.x`，服务器在 `192.168.0.6`）
+要靠 NAS 做 IP 转发。这里有**两个独立的坑**，缺一个都不通：
 
-脚本会自动修补（`allow_lan_forward`）：插入带 `sc-lan-forward` 注释的规则，只放行
-`LAN_CIDR → 192.168.0.0/16、10.0.0.0/8、172.16.0.0/12、100.64.0.0/10`，
-再注册 `shellcrash-lan-forward.service` 开机重建（iptables 规则重启即丢）。
+**坑 1：Docker 把 `FORWARD` 策略设成 DROP**
+飞牛装了 Docker，Docker 会把 iptables 的 `FORWARD` 策略改成 DROP，NAS 默认不转发任何流量。
+表现：能上外网，但 `ping 192.168.0.6` 100% 丢包。
+
+**坑 2：回程路由不对称 —— SMB 共享文件夹打不开的元凶**
+客户机的包源地址是 `192.168.1.x`，NAS 转发时若原样保留源地址，`192.168.0.6` 的回包就要发给
+`192.168.1.x`；而 `192.168.0.1` 那一侧通常没有到 `192.168.1.0/24` 的路由，回包被丢弃。
+表现很迷惑：**`ping` 能通，但 445 端口连不上、共享文件夹打不开、SSH 卡在握手**。
+解法是让 NAS 做 SNAT，把源改写成 NAS 自己的地址，回程就对称了。
+
+脚本会自动做两件事（`allow_lan_forward`）：
+
+1. 插入带 `sc-lan-forward` 注释的放行规则，目标为 `192.168.0.0/16`、`10.0.0.0/8`、
+   `172.16.0.0/12`、`100.64.0.0/10`，**不限制源**（客户机在 `192.168.31.x`、`10.x` 也认）；
+2. 在 `nat POSTROUTING` 加同名 `MASQUERADE`，把跨网段流量的源改写成本机 LAN 地址，
+   并清掉残留 conntrack（否则旧的失败连接会绕过新规则）。
+
+最后注册 `shellcrash-lan-forward.service` 开机重建（iptables 规则重启即丢）。
 
 ```bash
 # 手动执行 / 修复
 sudo sh /etc/ShellCrash/lan_forward.sh
-# 看是否已放行
+# 看是否已放行 + 是否已伪装
 sudo iptables -S FORWARD | grep sc-lan-forward
+sudo iptables -t nat -S POSTROUTING | grep sc-lan-forward-snat
 ```
 
-> 只放行内网网段，公网流量仍被 ShellCrash 接管，不会绕过代理。<br>
-> 如果你的 NAS 没装 Docker（`FORWARD` 策略是 ACCEPT），脚本会自动跳过这一步。
+验证某台内网服务器（客户机视角，直接告诉你 445 通不通）：
+
+```bash
+sudo sh /tmp/sc_verify.sh 192.168.1.0/24 192.168.0.6
+```
+
+> 放行只针对内网网段，公网流量仍被 ShellCrash 接管，不会变成开放路由器。<br>
+> SNAT 的源改写只影响「客户机 → 其它内网网段」，NAS 自己访问内网服务器不受影响。
 
 ## 六、验证
 
 ```bash
-sudo sh /tmp/sc_verify.sh                 # 自动读配置里的网段
+sudo sh /tmp/sc_verify.sh                              # 自动读配置里的网段
+sudo sh /tmp/sc_verify.sh 192.168.1.0/24 192.168.0.6   # 顺带实测某台内网服务器的 445
 sudo sh /tmp/sc_verify.sh 192.168.1.0/24  # 或手动指定
 ```
 
@@ -146,7 +168,8 @@ sudo sh /tmp/sc_verify.sh 192.168.1.0/24  # 或手动指定
 | **/etc/profile 的别名优先于命令** | 明明装了 `/usr/bin/crash` 却仍以普通用户身份跑菜单 | 别名改成 `alias crash="sudo -E bash /etc/ShellCrash/menu.sh"`，或 `unalias crash` |
 | **新手引导会重置配置** | 进菜单选了「1) 推荐配置」，`Tproxy` 被改回 `Mix`、`fake-ip` 被改成 `mix`，代理失效 | 在 `ShellCrash.cfg` 写 `userguide=1` 跳过引导 |
 | **非 80/443 端口不走代理** | 只有网页能用，其他端口服务连不上 | `common_ports=OFF`（默认的「只代理常用端口」要关掉） |
-| **Docker 把 FORWARD 设成 DROP** | 能上外网，但访问另一个网段的服务器（如 `192.168.0.5`）全部超时、100% 丢包 | 跑 `sudo sh /etc/ShellCrash/lan_forward.sh` 放行内网转发；重跑 `sc_deploy.sh` 会自动补 |
+| **Docker 把 FORWARD 设成 DROP** | 能上外网，但访问另一个网段的服务器（如 `192.168.0.6`）全部超时、100% 丢包 | 跑 `sudo sh /etc/ShellCrash/lan_forward.sh` 放行内网转发；重跑 `sc_deploy.sh` 会自动补 |
+| **跨网段缺 SNAT（回程不对称）** | `ping` 通，但 **SMB 共享文件夹打不开**、445 连不上、SSH 卡在握手 | 服务器回包要绕回客户机网段，另一侧路由器没这条路由。`lan_forward.sh` 会加 `nat POSTROUTING MASQUERADE` 把源改成本机地址 |
 
 ## 八、日常维护
 
@@ -201,4 +224,5 @@ sudo sh /tmp/sc_uninstall.sh --yes    # 免确认
 | DNS 解析失败 | 53 被别的服务占用；`ss -ulnp \| grep :53` 查 |
 | 只有 443 能用，80 不行 | 检查 nft 表 `nft list table inet shellcrash` 是否只有 tcp 规则 |
 | 重启 NAS 后失效 | `systemctl is-enabled shellcrash`；飞牛应用中心是否把 clash-for-fnos 又拉起来了 |
-| 能上外网但打不开别的网段的服务器 | `sudo iptables -S FORWARD \| head -1` 若是 `-P FORWARD DROP` 且没有 `sc-lan-forward` 规则 → 跑 `sudo sh /etc/ShellCrash/lan_forward.sh` |
+| 能上外网但打不开别的网段的服务器（`ping` 也不通） | `sudo iptables -S FORWARD \| head -1` 若是 `-P FORWARD DROP` 且没有 `sc-lan-forward` 规则 → 跑 `sudo sh /etc/ShellCrash/lan_forward.sh` |
+| `ping` 通，但共享文件夹/445/SSH 连不上 | 缺 SNAT：`sudo iptables -t nat -S POSTROUTING \| grep sc-lan-forward-snat`，为空就跑 `sudo sh /etc/ShellCrash/lan_forward.sh` |

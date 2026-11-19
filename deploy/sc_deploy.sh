@@ -113,6 +113,11 @@ detect_env() {
             c_y "iptables FORWARD 策略是 DROP（Docker 写的）—— 客户机改网关后将访问不了其它内网网段（如 192.168.0.x），部署时脚本会自动放行"
         fi
     fi
+    if iptables -t nat -S POSTROUTING 2>/dev/null | grep -q 'sc-lan-forward-snat'; then
+        echo "跨网段 SNAT：已启用（内网服务器看到的源是本机地址，回程对称）"
+    else
+        c_y "跨网段 SNAT 未启用 —— 客户机访问其它网段的服务器（尤其 SMB 445 共享文件夹）会连接超时，部署时脚本会自动加上"
+    fi
 
     # 端口占用（把同一个代理内核占用的多个端口合并成一条，避免刷屏）
     PROXY_PORTS=""; PROXY_NAME=""; PROXY_PID=""
@@ -264,38 +269,70 @@ write_config() {
 # 这样一来：客户机把网关指向 NAS 后，所有「客户机 → 其它网段（192.168.x/10.x/172.16-31.x）」
 # 的包在 NAS 上被静默丢弃，表现为能上外网、但访问不了另一个网段的服务器。
 allow_lan_forward() {
-    step "放行局域网到内网的转发（修 Docker 的 FORWARD DROP）"
+    step "放行内网转发 + 跨网段 SNAT（修 Docker 的 FORWARD DROP 与回程不对称）"
     command -v iptables >/dev/null 2>&1 || { c_y "没有 iptables，跳过"; return 0; }
-
-    if ! iptables -S FORWARD 2>/dev/null | grep -q '^-P FORWARD DROP'; then
-        c_g "FORWARD 策略不是 DROP，无需修改"
-        return 0
-    fi
 
     cat >"$CRASHDIR"/lan_forward.sh <<'EOF'
 #!/bin/sh
-# 放行「局域网客户端 → 其它内网网段」的转发。
-# 背景：Docker 把 FORWARD 策略设为 DROP，导致网关指向本机的客户机访问不了其它网段。
+# 放行「客户机 → 其它内网网段」的转发，并对跨网段流量做 SNAT。
+#
+# 解决两个问题：
+#   1. Docker 会把 FORWARD 策略设成 DROP，跨网段转发被静默丢弃；
+#   2. 不做 SNAT 时，内网服务器看到的源地址是客户机所在网段，回包要经另一台
+#      路由器绕回来，多数家用网络没有这条回程路由 —— 表现为 ping 通但连不上，
+#      SMB 共享文件夹（445）最典型。
+#
+# 用法：lan_forward.sh [客户机网段] [出口网卡]
 # 幂等：每次先按注释标签清掉自己加的规则，再加回去。
 set -u
+TAG=sc-lan-forward
 LAN_CIDR="${1:-}"
+LAN_IF="${2:-}"
+
 [ -z "$LAN_CIDR" ] && [ -f /etc/ShellCrash/configs/ShellCrash.cfg ] && \
     LAN_CIDR=$(awk -F= '/^cust_host_ipv4=/{print $2}' /etc/ShellCrash/configs/ShellCrash.cfg)
-[ -n "$LAN_CIDR" ] || exit 0
+[ -n "$LAN_IF" ] || LAN_IF=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
+[ -n "$LAN_IF" ] || exit 0
 command -v iptables >/dev/null 2>&1 || exit 0
 
-iptables -S FORWARD 2>/dev/null | grep -F 'sc-lan-forward' | sed 's/^-A /-D /' | while read -r r; do
+LAN_ADDR=$(ip -4 -o addr show dev "$LAN_IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+
+# ---------- 幂等清理 ----------
+iptables -S FORWARD 2>/dev/null | grep -F "$TAG" | sed 's/^-A /-D /' | while read -r r; do
     iptables $r 2>/dev/null || true
 done
+iptables -t nat -S POSTROUTING 2>/dev/null | grep -F "$TAG" | sed 's/^-A /-D /' | while read -r r; do
+    iptables -t nat $r 2>/dev/null || true
+done
 
-# 回程包（内网服务器 → 客户机）走 ESTABLISHED/RELATED，必须放行
-iptables -I FORWARD 1 -m comment --comment sc-lan-forward \
+# ---------- 回程包 ----------
+# 内网服务器 → 客户机 的应答走 ESTABLISHED，必须放行
+iptables -I FORWARD 1 -m comment --comment "$TAG" \
     -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
-# 只放行到内网网段的新连接：192.168/16、10/8、172.16/12、100.64/10（Tailscale 等）
+# ---------- 放行 + 伪装 ----------
 for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 100.64.0.0/10; do
-    iptables -I FORWARD 1 -m comment --comment sc-lan-forward -s "$LAN_CIDR" -d "$net" -j ACCEPT
+    # 源不限：客户机可能在 192.168.1.x，也可能在 192.168.11.x / 10.x
+    iptables -I FORWARD 1 -m comment --comment "$TAG" -d "$net" -j ACCEPT
+
+    # 跨网段 SNAT：把源改成本机地址，回程才对称
+    # 排除本机自己发出的包（源已经是 LAN_ADDR），避免干扰 NAS 自身的挂载/访问
+    if [ -n "$LAN_ADDR" ]; then
+        iptables -t nat -A POSTROUTING -m comment --comment "$TAG-snat" \
+            -d "$net" ! -s "$LAN_ADDR" -o "$LAN_IF" -j MASQUERADE
+    else
+        iptables -t nat -A POSTROUTING -m comment --comment "$TAG-snat" \
+            -d "$net" -o "$LAN_IF" -j MASQUERADE
+    fi
 done
+
+# ---------- 清旧连接 ----------
+# NAT 规则只对「首个包」生效，残留的失败连接会绕过新规则，必须清掉
+if command -v conntrack >/dev/null 2>&1; then
+    for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12; do
+        conntrack -D -d "$net" >/dev/null 2>&1 || true
+    done
+fi
 EOF
     chmod 755 "$CRASHDIR"/lan_forward.sh
     sh "$CRASHDIR"/lan_forward.sh "$LAN_CIDR" || { c_y "规则写入失败（不影响代理，仅内网互访）"; return 0; }
@@ -304,7 +341,7 @@ EOF
     if command -v systemctl >/dev/null 2>&1; then
         cat >/etc/systemd/system/shellcrash-lan-forward.service <<'EOF'
 [Unit]
-Description=ShellCrash: 放行局域网到内网的转发（修补 Docker 的 FORWARD DROP）
+Description=ShellCrash: 放行内网转发并对跨网段流量做 SNAT
 After=network-online.target docker.service
 Wants=network-online.target
 
@@ -318,10 +355,11 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload 2>/dev/null
         systemctl enable shellcrash-lan-forward >/dev/null 2>&1
+        systemctl restart shellcrash-lan-forward >/dev/null 2>&1
         echo "开机自启：$(systemctl is-enabled shellcrash-lan-forward 2>/dev/null)"
     fi
-    c_g "已放行 $LAN_CIDR → 192.168.0.0/16、10.0.0.0/8、172.16.0.0/12、100.64.0.0/10"
-    c_y "  说明：只放行内网网段。客户机访问互联网的流量仍由 ShellCrash 接管，不会绕过代理"
+    c_g "已放行任意来源 → 192.168.0.0/16、10.0.0.0/8、172.16.0.0/12、100.64.0.0/10，并对跨网段流量做 SNAT"
+    c_y "  说明：SNAT 让内网服务器看到的源是本机地址，回程才对称（SMB/NFS 必须）；公网流量仍由 ShellCrash 接管"
 }
 
 # ---------- 5. 修好 crash 命令 ----------

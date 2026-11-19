@@ -32,6 +32,10 @@ nft delete table inet shellcrash 2>/dev/null && echo "  nft 表已删除"
 iptables -S FORWARD 2>/dev/null | grep -F 'sc-lan-forward' | sed 's/^-A /-D /' | while read -r r; do
     iptables $r 2>/dev/null && echo "  已删除：$r"
 done
+# 跨网段 SNAT 规则
+iptables -t nat -S POSTROUTING 2>/dev/null | grep -F 'sc-lan-forward' | sed 's/^-A /-D /' | while read -r r; do
+    iptables -t nat $r 2>/dev/null && echo "  已删除(NAT)：$r"
+done
 for t in nat mangle; do
     iptables -t $t -D PREROUTING -j SHELLCRASH 2>/dev/null
     iptables -t $t -F SHELLCRASH 2>/dev/null && iptables -t $t -X SHELLCRASH 2>/dev/null

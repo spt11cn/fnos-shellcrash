@@ -2,7 +2,8 @@
 # ============================================================
 # 验证「局域网电脑把网关+DNS 指向 NAS」能否走代理
 # 原理：在 NAS 上建临时网络命名空间模拟一台客户机，测完自动清理
-# 用法：sudo sh sc_verify.sh [局域网网段]   例：sudo sh sc_verify.sh 192.168.1.0/24
+# 用法：sudo sh sc_verify.sh [局域网网段] [内网服务器IP]
+#   例：sudo sh sc_verify.sh 192.168.1.0/24 192.168.0.6
 # ============================================================
 set -u
 CRASHDIR=${CRASHDIR:-/etc/ShellCrash}
@@ -24,6 +25,7 @@ NS=sc_verify
 cleanup() {
     ip netns del $NS 2>/dev/null
     ip link del scveth0 2>/dev/null
+    rm -rf /etc/netns/$NS 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
@@ -40,6 +42,9 @@ ip netns exec $NS ip link set scveth1 up
 ip netns exec $NS ip addr add $CLI/32 dev scveth1
 ip netns exec $NS ip route add $GW/32 dev scveth1
 ip netns exec $NS ip route add default via $GW
+# netns 内用 NAS 做 DNS（宿主的 resolv.conf 若指向 127.0.0.1 在命名空间里无效）
+mkdir -p /etc/netns/$NS
+echo "nameserver $NAS_IP" > /etc/netns/$NS/resolv.conf
 sleep 1
 
 echo "=== 1. DNS（问 $NAS_IP） ==="
@@ -72,7 +77,7 @@ ip netns exec $NS timeout 25 curl -4 -s -o /dev/null -w "  baidu=%{http_code} �
 echo "=== 6. 非 80/443 端口 ==="
 ip netns exec $NS timeout 25 curl -4 -s -o /dev/null -w "  httpbin=%{http_code}\n" http://httpbin.org/get
 
-echo "=== 7. 内网互访（访问其它网段的服务器，如 192.168.0.5） ==="
+echo "=== 7. 内网互访（跨网段访问其它内网服务器）==="
 FW=$(iptables -S FORWARD 2>/dev/null | head -1)
 if echo "$FW" | grep -q 'FORWARD DROP'; then
     if iptables -S FORWARD 2>/dev/null | grep -q 'sc-lan-forward'; then
@@ -84,6 +89,32 @@ if echo "$FW" | grep -q 'FORWARD DROP'; then
     fi
 else
     echo "  FORWARD 策略非 DROP → 正常"
+fi
+if iptables -t nat -S POSTROUTING 2>/dev/null | grep -q 'sc-lan-forward-snat'; then
+    echo "  跨网段 SNAT：已启用（服务器看到的源是本机地址，回程对称）"
+else
+    echo "  ⚠ 跨网段 SNAT 未启用"
+    echo "    → 症状：能 ping 通，但 SMB 共享文件夹（445）、SSH 等连接超时"
+    echo "    → 原因：服务器回包要绕回客户机所在网段，另一侧路由器通常没有这条路由"
+    echo "    → 修复：sh /etc/ShellCrash/lan_forward.sh   （v1.5 起部署脚本会自动加）"
+fi
+
+INTRANET="${2:-}"
+if [ -n "$INTRANET" ]; then
+    echo "  实测 $INTRANET（客户机视角）："
+    if ip netns exec $NS timeout 10 ping -c 3 -W 2 "$INTRANET" >/tmp/sc_ping.txt 2>&1; then
+        echo "    ping：$(tail -2 /tmp/sc_ping.txt | head -1)"
+    else
+        echo "    ⚠ ping 不通"
+    fi
+    for p in 445 139; do
+        if ip netns exec $NS timeout 6 bash -c "exec 3<>/dev/tcp/$INTRANET/$p" 2>/dev/null; then
+            echo "    端口 $p：open"
+        else
+            echo "    端口 $p：不通"
+        fi
+    done
+    rm -f /tmp/sc_ping.txt
 fi
 
 echo

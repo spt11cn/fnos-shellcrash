@@ -30,17 +30,18 @@
 - 自动处理名字带 `ovs` 的网卡（ShellCrash 自动探测网段时会跳过它）
 - 写死关键配置：`redir_mod=Tproxy`、`dns_mod=fake-ip`、`common_ports=OFF`、`userguide=1`
 - 给普通用户补一个会自己 sudo 的 `crash` 命令，并把 `/etc/profile` 里会被覆盖的别名一起改掉
-- 放行「局域网 → 其它内网网段」的转发（飞牛的 Docker 会把 iptables `FORWARD` 设成 DROP），并注册开机服务重建规则
+- 放行「客户机 → 其它内网网段」的转发（飞牛的 Docker 会把 iptables `FORWARD` 设成 DROP），
+  并对跨网段流量做 SNAT（否则服务器回包找不到路，SMB 共享文件夹打不开），注册开机服务重建规则
 - 注册开机自启
 
 ## 快速开始 · 图形版
 
 1. 取 `ShellCrashDeployer.exe`（单文件、免安装，Windows 10/11）：直接下载仓库里的
    [`dist/ShellCrashDeployer.exe`](dist/ShellCrashDeployer.exe)，或到
-   [Releases](https://github.com/spt11cn/fnos-shellcrash/releases) 页面取最新版（当前 **v1.4**）。
+   [Releases](https://github.com/spt11cn/fnos-shellcrash/releases) 页面取最新版（当前 **v1.5**）。
 
    校验（可选）：`certutil -hashfile ShellCrashDeployer.exe SHA256` 应为
-   `208e8b4c81178d07e3560d35fe00023d875b54c7c3dcafb8ff9a0768a7ac9433`（14,918,342 字节）。
+   `02e55e53b965c6d37a8ef9c14a5889133709cf471dd5cd780a52b7852c00ab14`（14,920,157 字节）。
 2. 双击运行，浏览器自动打开 `http://127.0.0.1:8799`。
 3. 依次点：**扫描局域网 → 选中带 `飞牛 fnOS` 标签的设备 → 填用户名密码 → ① 环境体检 → ② 一键部署 → ③ 验证连通**。
 
@@ -98,7 +99,8 @@ ssh 用户@NAS_IP 'sudo sh /tmp/sc_verify.sh'
 | 只有网页能走代理 | 非 80/443 端口的应用连不上 | `common_ports=OFF` |
 | 端口被抢 | 飞牛应用中心的 `clash-for-fnos` 占着 `53`、`7890` | 先在应用中心停掉并关掉自启 |
 | 验证偶发 `000` | 固定 IP 反复测试，被 conntrack 残留连接拖累 | 验证脚本每次随机 IP 新建 netns，带 3 次重试 |
-| **Docker 的 `FORWARD DROP`** | 客户机能上外网，但访问**另一个网段**的服务器（如 `192.168.0.5`）全部超时，`ping` 100% 丢包 | 飞牛装了 Docker 会把 iptables `FORWARD` 策略设成 DROP，NAS 不再转发任何「跨网段」流量。部署脚本自动插 `sc-lan-forward` 规则放行到 `192.168/16`、`10/8`、`172.16/12`、`100.64/10`，并注册 `shellcrash-lan-forward.service` 开机重建（iptables 规则重启即丢） |
+| **Docker 的 `FORWARD DROP`** | 客户机能上外网，但访问**另一个网段**的服务器（如 `192.168.0.6`）全部超时，`ping` 100% 丢包 | 飞牛装了 Docker 会把 iptables `FORWARD` 策略设成 DROP，NAS 不再转发任何「跨网段」流量。部署脚本自动插 `sc-lan-forward` 规则放行到 `192.168/16`、`10/8`、`172.16/12`、`100.64/10`，并注册开机服务重建 |
+| **跨网段缺 SNAT** | `ping` 通，但**共享文件夹打不开**、445 连不上、SSH 卡在握手 | 客户机源地址是 `192.168.x`，服务器回包要经另一台路由器绕回，而它通常没有这条路由。脚本加 `nat POSTROUTING MASQUERADE`，把源改写成本机地址，回程才对称 |
 
 ## 目录结构
 
