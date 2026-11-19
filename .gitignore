@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.spec
+build/
+gui/build/
+gui/dist/
+dist/*.old
+*.old
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 本地临时文件（不要提交调试脚本和日志）
+.tmp/
+*.log
