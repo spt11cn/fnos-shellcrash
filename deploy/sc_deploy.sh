@@ -106,6 +106,13 @@ detect_env() {
     echo "将用于代理的局域网网段：$LAN_CIDR"
 
     echo "IP 转发：$(cat /proc/sys/net/ipv4/ip_forward)（0 表示未开启，脚本会打开）"
+    if iptables -S FORWARD 2>/dev/null | grep -q '^-P FORWARD DROP'; then
+        if iptables -S FORWARD 2>/dev/null | grep -q 'sc-lan-forward'; then
+            echo "内网转发：已放行（sc-lan-forward 规则存在）"
+        else
+            c_y "iptables FORWARD 策略是 DROP（Docker 写的）—— 客户机改网关后将访问不了其它内网网段（如 192.168.0.x），部署时脚本会自动放行"
+        fi
+    fi
 
     # 端口占用（把同一个代理内核占用的多个端口合并成一条，避免刷屏）
     PROXY_PORTS=""; PROXY_NAME=""; PROXY_PID=""
@@ -252,6 +259,71 @@ write_config() {
     fi
 }
 
+# ---------- 4.5 放行局域网 → 其它内网的转发 ----------
+# 飞牛装了 Docker，Docker 会把 iptables 的 FORWARD 策略设成 DROP。
+# 这样一来：客户机把网关指向 NAS 后，所有「客户机 → 其它网段（192.168.x/10.x/172.16-31.x）」
+# 的包在 NAS 上被静默丢弃，表现为能上外网、但访问不了另一个网段的服务器。
+allow_lan_forward() {
+    step "放行局域网到内网的转发（修 Docker 的 FORWARD DROP）"
+    command -v iptables >/dev/null 2>&1 || { c_y "没有 iptables，跳过"; return 0; }
+
+    if ! iptables -S FORWARD 2>/dev/null | grep -q '^-P FORWARD DROP'; then
+        c_g "FORWARD 策略不是 DROP，无需修改"
+        return 0
+    fi
+
+    cat >"$CRASHDIR"/lan_forward.sh <<'EOF'
+#!/bin/sh
+# 放行「局域网客户端 → 其它内网网段」的转发。
+# 背景：Docker 把 FORWARD 策略设为 DROP，导致网关指向本机的客户机访问不了其它网段。
+# 幂等：每次先按注释标签清掉自己加的规则，再加回去。
+set -u
+LAN_CIDR="${1:-}"
+[ -z "$LAN_CIDR" ] && [ -f /etc/ShellCrash/configs/ShellCrash.cfg ] && \
+    LAN_CIDR=$(awk -F= '/^cust_host_ipv4=/{print $2}' /etc/ShellCrash/configs/ShellCrash.cfg)
+[ -n "$LAN_CIDR" ] || exit 0
+command -v iptables >/dev/null 2>&1 || exit 0
+
+iptables -S FORWARD 2>/dev/null | grep -F 'sc-lan-forward' | sed 's/^-A /-D /' | while read -r r; do
+    iptables $r 2>/dev/null || true
+done
+
+# 回程包（内网服务器 → 客户机）走 ESTABLISHED/RELATED，必须放行
+iptables -I FORWARD 1 -m comment --comment sc-lan-forward \
+    -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+# 只放行到内网网段的新连接：192.168/16、10/8、172.16/12、100.64/10（Tailscale 等）
+for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12 100.64.0.0/10; do
+    iptables -I FORWARD 1 -m comment --comment sc-lan-forward -s "$LAN_CIDR" -d "$net" -j ACCEPT
+done
+EOF
+    chmod 755 "$CRASHDIR"/lan_forward.sh
+    sh "$CRASHDIR"/lan_forward.sh "$LAN_CIDR" || { c_y "规则写入失败（不影响代理，仅内网互访）"; return 0; }
+
+    # 开机自动重建（iptables 规则重启即丢）
+    if command -v systemctl >/dev/null 2>&1; then
+        cat >/etc/systemd/system/shellcrash-lan-forward.service <<'EOF'
+[Unit]
+Description=ShellCrash: 放行局域网到内网的转发（修补 Docker 的 FORWARD DROP）
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /etc/ShellCrash/lan_forward.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload 2>/dev/null
+        systemctl enable shellcrash-lan-forward >/dev/null 2>&1
+        echo "开机自启：$(systemctl is-enabled shellcrash-lan-forward 2>/dev/null)"
+    fi
+    c_g "已放行 $LAN_CIDR → 192.168.0.0/16、10.0.0.0/8、172.16.0.0/12、100.64.0.0/10"
+    c_y "  说明：只放行内网网段。客户机访问互联网的流量仍由 ShellCrash 接管，不会绕过代理"
+}
+
 # ---------- 5. 修好 crash 命令 ----------
 fix_alias() {
     step "修复 crash 命令（别名优先级坑）"
@@ -321,12 +393,14 @@ install_sc
 install_core
 write_config
 fix_alias
+allow_lan_forward
 start_sc
 
 step "完成"
 cat <<EOF
 管理菜单：crash           （需重新登录或先执行 unalias crash）
 客户端设置：网关 + DNS 都填本机局域网 IP
+内网互访：已放行到 192.168/10/172.16-31 的转发（Docker 的 FORWARD DROP 修补）
 验证脚本：sh sc_verify.sh
 回滚脚本：sh sc_uninstall.sh
 EOF

@@ -47,7 +47,7 @@ except Exception:  # 开发态直接读目录
                 SCRIPTS[_n] = f.read()
 
 APP_NAME = "ShellCrash 飞牛 NAS 部署器"
-VERSION = "1.3"
+VERSION = "1.4"
 TOKEN = secrets.token_urlsafe(18)
 
 RUNS = {}

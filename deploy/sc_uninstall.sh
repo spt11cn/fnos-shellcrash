@@ -20,11 +20,18 @@ fi
 
 echo "== 停止服务 =="
 systemctl disable --now shellcrash 2>/dev/null
+systemctl disable --now shellcrash-lan-forward 2>/dev/null
+rm -f /etc/systemd/system/shellcrash-lan-forward.service
+systemctl daemon-reload 2>/dev/null
 sh "$CRASHDIR"/start.sh stop 2>/dev/null
 sh "$CRASHDIR"/starts/fw_stop.sh 2>/dev/null
 
 echo "== 清理残留规则 =="
 nft delete table inet shellcrash 2>/dev/null && echo "  nft 表已删除"
+# 放行内网转发的规则（Docker 的 FORWARD DROP 修补）
+iptables -S FORWARD 2>/dev/null | grep -F 'sc-lan-forward' | sed 's/^-A /-D /' | while read -r r; do
+    iptables $r 2>/dev/null && echo "  已删除：$r"
+done
 for t in nat mangle; do
     iptables -t $t -D PREROUTING -j SHELLCRASH 2>/dev/null
     iptables -t $t -F SHELLCRASH 2>/dev/null && iptables -t $t -X SHELLCRASH 2>/dev/null

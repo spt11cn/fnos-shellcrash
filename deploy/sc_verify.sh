@@ -72,9 +72,24 @@ ip netns exec $NS timeout 25 curl -4 -s -o /dev/null -w "  baidu=%{http_code} �
 echo "=== 6. 非 80/443 端口 ==="
 ip netns exec $NS timeout 25 curl -4 -s -o /dev/null -w "  httpbin=%{http_code}\n" http://httpbin.org/get
 
+echo "=== 7. 内网互访（访问其它网段的服务器，如 192.168.0.5） ==="
+FW=$(iptables -S FORWARD 2>/dev/null | head -1)
+if echo "$FW" | grep -q 'FORWARD DROP'; then
+    if iptables -S FORWARD 2>/dev/null | grep -q 'sc-lan-forward'; then
+        echo "  FORWARD 策略 DROP，但已放行内网网段 → 正常"
+    else
+        echo "  ⚠ FORWARD 策略 DROP 且没有放行规则（Docker 装的）"
+        echo "    → 客户机改网关后能上外网，但访问 192.168.0.x 之类的其它网段会超时"
+        echo "    → 修复：sh /etc/ShellCrash/lan_forward.sh   （或重跑 sc_deploy.sh）"
+    fi
+else
+    echo "  FORWARD 策略非 DROP → 正常"
+fi
+
 echo
 echo "判定标准："
 echo "  google=204（第2、3步都是）  → 透明代理与代理端口都通"
 echo "  baidu 耗时 < 0.5s           → 国内流量未绕代理，分流正常"
 echo "  出口 IP 显示本机公网 IP     → 该站点命中直连规则，属正常"
 echo "  httpbin=200                 → 非 80/443 端口也走代理（common_ports=OFF 生效）"
+echo "  第 7 步无 ⚠                 → 客户机能访问其它内网网段"
