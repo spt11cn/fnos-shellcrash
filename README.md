@@ -37,7 +37,10 @@
 
 1. 取 `ShellCrashDeployer.exe`（单文件、免安装，Windows 10/11）：直接下载仓库里的
    [`dist/ShellCrashDeployer.exe`](dist/ShellCrashDeployer.exe)，或到
-   [Releases](https://github.com/spt11cn/fnos-shellcrash/releases) 页面取。
+   [Releases](https://github.com/spt11cn/fnos-shellcrash/releases) 页面取最新版（当前 **v1.4**）。
+
+   校验（可选）：`certutil -hashfile ShellCrashDeployer.exe SHA256` 应为
+   `208e8b4c81178d07e3560d35fe00023d875b54c7c3dcafb8ff9a0768a7ac9433`（14,918,342 字节）。
 2. 双击运行，浏览器自动打开 `http://127.0.0.1:8799`。
 3. 依次点：**扫描局域网 → 选中带 `飞牛 fnOS` 标签的设备 → 填用户名密码 → ① 环境体检 → ② 一键部署 → ③ 验证连通**。
 
