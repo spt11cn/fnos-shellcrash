@@ -8,8 +8,9 @@
 - **图形版（推荐）**：Windows 双击 `dist/ShellCrashDeployer.exe`，填 NAS 地址和密码，点三个按钮。
 - **脚本版（SSH 熟手）**：`deploy/` 下三个 `.sh`，`--check` 先体检，再一键部署。
 
-另有配套的 **规则管理器** `dist/ShellCrashRuleManager.exe`：图形化管理自定义策略组和自定义规则
-（增删改、自动备份、一键重启内核），详见 [`rule-manager/使用说明.md`](rule-manager/使用说明.md)。两个 exe 互不冲突、都只在关闭网页后自动退出。
+另有配套的 **规则管理器**（图形化管理自定义策略组和自定义规则、自动备份、一键重启内核），
+已拆成独立项目 👉 [spt11cn/shellcrash-rule-manager](https://github.com/spt11cn/shellcrash-rule-manager)。
+两个程序互不冲突，都只在关闭网页后自动退出。
 
 > 全流程在飞牛 fnOS（Intel J1900 / Debian 12 / 网卡 `enp1s0-ovs`）上实测通过，包括开机自启、分流、
 > 非 443 端口、命名空间端到端验证。下面列出的「坑」都是真踩过的。
@@ -45,8 +46,6 @@
 
    校验（可选）：`certutil -hashfile ShellCrashDeployer.exe SHA256` 应为
    `189ae7f1cdfa36d5ea50404e340e6095a15c95b74a9676d96f85426a26372d5f`（14,919,883 字节）。
-   配套的 `ShellCrashRuleManager.exe` SHA256：
-   `7008f8a868b7ed9c3dd5625184cb92aef234ffb172eeead1a3138789ea85ed9f`（14,909,334 字节）。
 2. 双击运行，浏览器自动打开 `http://127.0.0.1:8799`。
 3. 依次点：**扫描局域网 → 选中带 `飞牛 fnOS` 标签的设备 → 填用户名密码 → ① 环境体检 → ② 一键部署 → ③ 验证连通**。
 
@@ -114,13 +113,11 @@ deploy/            三个可独立使用的 .sh 脚本 + 完整部署手册
 gui/               部署器源码（Python 标准库 + paramiko，打包成单文件 exe）
   gui_app.py       本地 HTTP 服务 + 页面 + SSH 执行 + ANSI 日志解析
   build.py         把 deploy/*.sh 内嵌进源码后打包 exe
-rule-manager/      规则管理器源码（自定义策略组 / 自定义规则的图形化管理）
-  gui_app.py       内嵌远程 agent，读写 yamls/proxy-groups.yaml 与 rules.yaml
-  build.py         打包成单文件 exe
 dist/              打包好的 Windows 单文件 exe
   ShellCrashDeployer.exe    部署器
-  ShellCrashRuleManager.exe 规则管理器
 ```
+
+规则管理器不在本仓库，见 [spt11cn/shellcrash-rule-manager](https://github.com/spt11cn/shellcrash-rule-manager)。
 
 ## 自己构建
 
