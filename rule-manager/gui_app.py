@@ -541,8 +541,24 @@ def ssh_connect(host, user, pwd):
         raise RuntimeError("缺少 paramiko 模块")
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(host.strip(), 22, user.strip(), pwd, timeout=15,
-              allow_agent=False, look_for_keys=False)
+    if pwd:
+        c.connect(host.strip(), 22, user.strip(), pwd, timeout=15,
+                  allow_agent=False, look_for_keys=False)
+    else:
+        # 免密码登录（如 OpenWrt/iStoreOS 允许 root none 认证，MobaXterm 就是这么连的）。
+        # paramiko 的 connect(password='') 不会触发 none 认证，这里用底层 Transport 完成认证，
+        # 再挂到 SSHClient 上，保证 exec_command 等接口照常可用。
+        import socket as _sock
+        _sockobj = _sock.create_connection((host.strip(), 22), timeout=15)
+        t = paramiko.Transport(_sockobj)
+        t.connect()
+        try:
+            t.auth_none(user.strip())
+        except paramiko.BadAuthenticationType:
+            t.auth_password(user.strip(), "")
+        if not t.is_authenticated():
+            raise RuntimeError("SSH 认证失败（服务端不允许免密登录）")
+        c._transport = t
     return c
 
 
@@ -553,22 +569,52 @@ def run_cmd(client, cmd, timeout=40):
     rc = stdout.channel.recv_exit_status()
     err = re.sub(r"^\[sudo\][^\n]*\n?", "", err)
     err = re.sub(r"^\[sudo\].*?password[^:]*:\s*", "", err, flags=re.I)
+    err = re.sub(r"sudo: [^\n]*\n?", "", err)
     return out, err, rc
 
 
+def _sudo_prefix(client):
+    """返回 sudo 命令前缀；若是 root 登录或系统无 sudo（如 OpenWrt），直接返回空。"""
+    try:
+        with SESS_LOCK:
+            user = (SESS.get("cfg") or {}).get("user", "")
+        out, err, rc = run_cmd(client, "id -u 2>/dev/null; command -v sudo 2>/dev/null", 8)
+        lines = [x.strip() for x in out.splitlines() if x.strip()]
+        uid = lines[0] if lines else ""
+        has_sudo = any("sudo" in x for x in lines[1:])
+        if uid == "0" or not has_sudo:
+            return ""      # root 或没装 sudo：直接跑
+    except Exception:
+        pass
+    return "sudo"
+
+
 def upload_agent(client, sudo_pwd):
+    """把 Python agent 写到远程机。兼容飞牛(有 base64/sudo)与 OpenWrt(无 base64、root 无 sudo)。
+    用 python3 自身解码，分块写入，避免 dropbear 命令行长度限制。"""
     b64 = base64.b64encode(AGENT_SCRIPT.encode("utf-8")).decode("ascii")
-    cmd = ("printf %%s '%s' | base64 -d > /tmp/sc_rules_agent.py && "
-           "chmod 755 /tmp/sc_rules_agent.py && echo %s | sudo -S -p '' "
-           "install -m 755 /tmp/sc_rules_agent.py /usr/local/bin/sc_rules_agent 2>/dev/null || true"
-           % (b64, shlex.quote(sudo_pwd)))
-    out, err, rc = run_cmd(client, cmd, 40)
-    if rc != 0:
-        # install 到 /usr/local/bin 失败也没关系，直接用 /tmp 的副本
-        chk = "test -s /tmp/sc_rules_agent.py && echo OK"
-        o, e, r = run_cmd(client, chk)
-        if "OK" not in o:
-            raise RuntimeError("上传远程助手失败: %s" % (err or e or "未知"))
+    sudo = _sudo_prefix(client)
+    CHUNK = 1200
+    chunks = [b64[i:i + CHUNK] for i in range(0, len(b64), CHUNK)]
+    # 先清空；每块用 python3 追加解码写入（不依赖 base64 命令）
+    run_cmd(client, "python3 -c \"open('/tmp/sc_rules_agent.py','wb').close()\"", 10)
+    for idx, part in enumerate(chunks):
+        py = ("import base64;f=open('/tmp/sc_rules_agent.py','ab');"
+              "f.write(base64.b64decode('%s'));f.close()" % part)
+        o, e, rc = run_cmd(client, "python3 -c %s" % shlex.quote(py), 15)
+        if rc != 0:
+            raise RuntimeError("上传远程助手失败(第%d块): %s" % (idx, e or o or "未知"))
+    if sudo:
+        install_cmd = ("chmod 755 /tmp/sc_rules_agent.py && "
+                       "echo %s | sudo -S -p '' install -m 755 /tmp/sc_rules_agent.py /usr/local/bin/sc_rules_agent 2>/dev/null || true"
+                       % shlex.quote(sudo_pwd))
+    else:
+        install_cmd = ("chmod 755 /tmp/sc_rules_agent.py && "
+                       "cp /tmp/sc_rules_agent.py /usr/local/bin/sc_rules_agent 2>/dev/null || true")
+    run_cmd(client, install_cmd, 20)
+    o, e, r = run_cmd(client, "test -s /tmp/sc_rules_agent.py && echo OK")
+    if "OK" not in o:
+        raise RuntimeError("上传远程助手失败: %s" % (e or o or "未知"))
 
 
 def agent_call(op, timeout=40, **kw):
@@ -582,8 +628,12 @@ def agent_call(op, timeout=40, **kw):
         json.dumps(dict(op=op, **kw), ensure_ascii=False).encode("utf-8")
     ).decode("ascii")
     sudo_pwd = cfg.get("sudo_pwd") or cfg.get("pwd") or ""
-    cmd = "echo %s | sudo -S -p '' python3 /tmp/sc_rules_agent.py %s" % (
-        shlex.quote(sudo_pwd), payload)
+    sudo = _sudo_prefix(client)
+    if sudo:
+        cmd = "echo %s | sudo -S -p '' python3 /tmp/sc_rules_agent.py %s" % (
+            shlex.quote(sudo_pwd), payload)
+    else:
+        cmd = "python3 /tmp/sc_rules_agent.py %s" % payload
     try:
         out, err, rc = run_cmd(client, cmd, timeout)
     except Exception as e:
@@ -696,8 +746,8 @@ class Handler(BaseHTTPRequestHandler):
             user = (body.get("user") or "").strip()
             pwd = body.get("pwd") or ""
             sudo_pwd = body.get("sudo_pwd") or pwd
-            if not host or not user or not pwd:
-                return self._send(400, {"error": "请填写 NAS 地址、用户名和密码"})
+            if not host or not user:
+                return self._send(400, {"error": "请填写 NAS 地址和用户名（免密登录可留空密码）"})
             with SESS_LOCK:
                 old = SESS.get("client")
                 if old:

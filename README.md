@@ -46,7 +46,7 @@
    校验（可选）：`certutil -hashfile ShellCrashDeployer.exe SHA256` 应为
    `189ae7f1cdfa36d5ea50404e340e6095a15c95b74a9676d96f85426a26372d5f`（14,919,883 字节）。
    配套的 `ShellCrashRuleManager.exe` SHA256：
-   `7f28ce9698f1b7286c231a8673a6855c669bb1a4d49a31c6309b0c4c745e1f62`（14,909,334 字节）。
+   `7008f8a868b7ed9c3dd5625184cb92aef234ffb172eeead1a3138789ea85ed9f`（14,909,334 字节）。
 2. 双击运行，浏览器自动打开 `http://127.0.0.1:8799`。
 3. 依次点：**扫描局域网 → 选中带 `飞牛 fnOS` 标签的设备 → 填用户名密码 → ① 环境体检 → ② 一键部署 → ③ 验证连通**。
 
